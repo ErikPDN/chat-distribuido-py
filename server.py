@@ -164,44 +164,44 @@ def client_thread(conn, addr):
                 header["from"] = username
                 deliver_to_user(to, header)
             elif t == "group_msg":
-                g = header.get("group")
+                group_name = header.get("group")
                 header["from"] = username
-                broadcast_group(g, header)
+                broadcast_group(group_name, header)
             elif t == "create_group":
-                g = header.get("group")
-                groups[g].add(username)
-                send_header(conn, {"type": "info", "message": f"group_created:{g}"})
+                group_name = header.get("group")
+                groups[group_name].add(username)
+                send_header(conn, {"type": "info", "message": f"group_created:{group_name}"})
             elif t == "join_group":
-                g = header.get("group")
-                groups[g].add(username)
-                send_header(conn, {"type": "info", "message": f"joined:{g}"})
+                group_name = header.get("group")
+                groups[group_name].add(username)
+                send_header(conn, {"type": "info", "message": f"joined:{group_name}"})
             elif t == "add_to_group":
-                g = header.get("group")
+                group_name = header.get("group")
                 user_to_add = header.get("user_to_add")
 
-                if g not in groups or username not in groups[g]:
+                if group_name not in groups or username not in groups[group_name]:
                     send_header(
                         conn,
                         {
                             "type": "error",
-                            "message": f"You can't add users to '{g}'.",
+                            "message": f"Você não tem permissão para adicionar usuários ao grupo '{group_name}'.",
                         },
                     )
                     continue
 
-                groups[g].add(user_to_add)
+                groups[group_name].add(user_to_add)
 
                 send_header(
                     conn,
                     {
                         "type": "info",
-                        "message": f"Usuário '{user_to_add}' foi adicionado ao grupo '{g}'.",
+                        "message": f"Usuário '{user_to_add}' foi adicionado ao grupo '{group_name}'.",
                     },
                 )
 
                 notification_header = {
                     "type": "info",
-                    "message": f"Você foi adicionado ao groupo '{g}' pelo {username}.",
+                    "message": f"Você foi adicionado ao groupo '{group_name}' pelo {username}.",
                 }
                 deliver_to_user(user_to_add, notification_header)
             elif t == "list":
@@ -212,7 +212,7 @@ def client_thread(conn, addr):
                     {
                         "type": "list",
                         "online": online,
-                        "groups": {g: list(m) for g, m in groups.items()},
+                        "groups": {group_name: list(m) for group_name, m in groups.items()},
                     },
                 )
             elif t == "file":
@@ -226,7 +226,7 @@ def client_thread(conn, addr):
                 else:
                     deliver_to_user(to, header, file_bytes)
             elif t == "quit":
-                print(f"{username} pediu quit")
+                print(f"{username} desconectou")
                 break
             else:
                 send_header(conn, {"type": "error", "message": "unknown_type"})
