@@ -7,6 +7,7 @@ Uso: python server.py [HOST] [PORT]
 import argparse
 import json
 import os
+import queue
 import socket
 import struct
 import threading
@@ -22,6 +23,7 @@ undelivered = defaultdict(
     list
 )  # username -> list of pending headers+payload (for offline delivery)
 groups = defaultdict(set)  # group_name -> set(usernames)
+message_queue = queue.Queue()
 
 
 def send_header(sock, header: dict):
@@ -32,17 +34,17 @@ def send_header(sock, header: dict):
 
 def recv_header(sock):
     # lê 4 bytes do tamanho
-    raw = recvall(sock, 4)
+    raw = recv_all(sock, 4)
     if not raw:
         return None
     (n,) = struct.unpack(">I", raw)
-    data = recvall(sock, n)
+    data = recv_all(sock, n)
     if not data:
         return None
     return json.loads(data.decode("utf-8"))
 
 
-def recvall(sock, n):
+def recv_all(sock, n):
     buf = b""
     while len(buf) < n:
         try:
@@ -129,6 +131,27 @@ def broadcast_group(group_name, header, file_bytes=None):
         deliver_to_user(u, header, file_bytes)
 
 
+def message_dispatcher():
+    """
+    Esta função roda em uma thread separada.
+    Ela consome mensagens da fila e as distribui.
+    """
+    while True:
+        # get() é bloqueante, a thread vai dormir até uma mensagem chegar
+        header, file_bytes, origin_username, target = message_queue.get()
+
+        if target.get("type") == "group":
+            group_name = target.get("name")
+            # Adiciona o remetente ao header para que o broadcast possa ignorá-lo
+            header["from"] = origin_username
+            broadcast_group(group_name, header, file_bytes)
+
+        elif target.get("type") == "user":
+            username = target.get("name")
+            header["from"] = origin_username
+            deliver_to_user(username, header, file_bytes)
+
+
 def client_thread(conn, addr):
     print(f"Conexão de {addr}")
     username = None
@@ -161,49 +184,48 @@ def client_thread(conn, addr):
             t = header.get("type")
             if t == "msg":
                 to = header.get("to")
-                header["from"] = username
-                deliver_to_user(to, header)
+                target = {"type": "user", "name": to}
+                message_queue.put((header, None, username, target))
             elif t == "group_msg":
-                group_name = header.get("group")
-                header["from"] = username
-                broadcast_group(group_name, header)
+                g = header.get("group")
+                target = {"type": "group", "name": g}
+                message_queue.put((header, None, username, target))
             elif t == "create_group":
-                group_name = header.get("group")
-                groups[group_name].add(username)
-                send_header(conn, {"type": "info", "message": f"group_created:{group_name}"})
+                g = header.get("group")
+                groups[g].add(username)
+                send_header(conn, {"type": "info", "message": f"group_created:{g}"})
             elif t == "join_group":
-                group_name = header.get("group")
-                groups[group_name].add(username)
-                send_header(conn, {"type": "info", "message": f"joined:{group_name}"})
+                g = header.get("group")
+                groups[g].add(username)
+                send_header(conn, {"type": "info", "message": f"joined:{g}"})
             elif t == "add_to_group":
-                group_name = header.get("group")
+                g = header.get("group")
                 user_to_add = header.get("user_to_add")
 
-                if group_name not in groups or username not in groups[group_name]:
+                if g not in groups or username not in groups[g]:
                     send_header(
                         conn,
                         {
                             "type": "error",
-                            "message": f"Você não tem permissão para adicionar usuários ao grupo '{group_name}'.",
+                            "message": f"You can't add users to '{g}'.",
                         },
                     )
                     continue
 
-                groups[group_name].add(user_to_add)
-
+                groups[g].add(user_to_add)
                 send_header(
                     conn,
                     {
                         "type": "info",
-                        "message": f"Usuário '{user_to_add}' foi adicionado ao grupo '{group_name}'.",
+                        "message": f"Usuário '{user_to_add}' foi adicionado ao grupo '{g}'.",
                     },
                 )
-
                 notification_header = {
                     "type": "info",
-                    "message": f"Você foi adicionado ao groupo '{group_name}' pelo {username}.",
+                    "message": f"Você foi adicionado ao groupo '{g}' pelo {username}.",
                 }
-                deliver_to_user(user_to_add, notification_header)
+                target = {"type": "user", "name": user_to_add}
+                message_queue.put((notification_header, None, username, target))
             elif t == "list":
                 with clients_lock:
                     online = list(clients.keys())
@@ -212,21 +234,24 @@ def client_thread(conn, addr):
                     {
                         "type": "list",
                         "online": online,
-                        "groups": {group_name: list(m) for group_name, m in groups.items()},
+                        "groups": {g: list(m) for g, m in groups.items()},
                     },
                 )
             elif t == "file":
-                to = header.get("to")
-                header["from"] = username
                 filesize = header.get("filesize", 0)
-                file_bytes = recvall(conn, filesize) if filesize > 0 else b""
-                # opcional: salvar no servidor enquanto retransmite (aqui apenas retransmite)
+                file_bytes = recv_all(conn, filesize) if filesize > 0 else b""
+
                 if header.get("target") == "group":
-                    broadcast_group(header.get("group"), header, file_bytes)
+                    g = header.get("group")
+                    target = {"type": "group", "name": g}
+                    message_queue.put((header, file_bytes, username, target))
                 else:
-                    deliver_to_user(to, header, file_bytes)
+                    to = header.get("to")
+                    target = {"type": "user", "name": to}
+                    message_queue.put((header, file_bytes, username, target))
+
             elif t == "quit":
-                print(f"{username} desconectou")
+                print(f"{username} pediu quit")
                 break
             else:
                 send_header(conn, {"type": "error", "message": "unknown_type"})
@@ -258,6 +283,10 @@ def main():
     srv.bind((args.host, args.port))
     srv.listen(100)
     print(f"Servidor ouvindo em {args.host}:{args.port}")
+
+    dispatcher = threading.Thread(target=message_dispatcher, daemon=True)
+    dispatcher.start()
+
     accept_loop(srv)
 
 
