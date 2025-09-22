@@ -7,6 +7,7 @@ Comandos:
   /msg <user> <message>
   /group create <group>
   /group join <group>
+  /group add <group> <user>
   /group msg <group> <message>
   /sendfile <user> <path>
   /sendgroupfile <group> <path>
@@ -191,7 +192,6 @@ def interactive(sock, username):
                 "Comandos: /msg <user> <text>, /group create/join/add/msg, /sendfile <user> <path>, /sendgroupfile <group> <path>, /list, /clear, /quit"
             )
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", required=True)
@@ -200,21 +200,37 @@ def main():
     args = parser.parse_args()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((args.host, args.port))
-    # auth
-    send_header(sock, {"type": "auth", "username": args.username})
-    hdr = recv_header(sock)
-    if hdr is None or hdr.get("type") == "error":
-        print("Falha ao autenticar:", hdr)
+    
+    try:
+        sock.connect((args.host, args.port))
+    except (socket.error, ConnectionRefusedError) as e:
+        # Captura erros de socket ou quando a conexão é recusada
+        print(f"Erro ao conectar ao servidor {args.host}:{args.port} - {e}")
         sock.close()
         return
-    print("Autenticado com sucesso.")
+    
+    # Se a conexão foi bem-sucedida, continuar com a autenticação
+    try:
+        # auth
+        send_header(sock, {"type": "auth", "username": args.username})
+        hdr = recv_header(sock)
+        if hdr is None or hdr.get("type") == "error":
+            print("Falha ao autenticar:", hdr)
+            sock.close()
+            return
+        print("Autenticado com sucesso.")
 
-    thr = threading.Thread(target=listener, args=(sock,), daemon=True)
-    thr.start()
+        # Iniciar thread de escuta (listener)
+        thr = threading.Thread(target=listener, args=(sock,), daemon=True)
+        thr.start()
 
-    interactive(sock, args.username)
+        # Interação após autenticação
+        interactive(sock, args.username)
 
+    except Exception as e:
+        # Captura erro no processo de autenticação ou interação
+        print(f"Ocorreu um erro: {e}")
+        sock.close()
 
 if __name__ == "__main__":
     main()
