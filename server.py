@@ -187,42 +187,42 @@ def client_thread(conn, addr):
                 target = {"type": "user", "name": to}
                 message_queue.put((header, None, username, target))
             elif t == "group_msg":
-                g = header.get("group")
-                target = {"type": "group", "name": g}
+                g_name = header.get("group")
+                target = {"type": "group", "name": g_name}
                 message_queue.put((header, None, username, target))
             elif t == "create_group":
-                g = header.get("group")
-                groups[g].add(username)
-                send_header(conn, {"type": "info", "message": f"group_created:{g}"})
+                g_name = header.get("group")
+                groups[g_name].add(username)
+                send_header(conn, {"type": "info", "message": f"group_created:{g_name}"})
             elif t == "join_group":
-                g = header.get("group")
-                groups[g].add(username)
-                send_header(conn, {"type": "info", "message": f"joined:{g}"})
+                g_name = header.get("group")
+                groups[g_name].add(username)
+                send_header(conn, {"type": "info", "message": f"joined:{g_name}"})
             elif t == "add_to_group":
-                g = header.get("group")
+                g_name = header.get("group")
                 user_to_add = header.get("user_to_add")
 
-                if g not in groups or username not in groups[g]:
+                if g_name not in groups or username not in groups[g_name]:
                     send_header(
                         conn,
                         {
                             "type": "error",
-                            "message": f"You can't add users to '{g}'.",
+                            "message": f"Você não tem permissão para adicionar usuários ao grupo '{g_name}'.",
                         },
                     )
                     continue
 
-                groups[g].add(user_to_add)
+                groups[g_name].add(user_to_add)
                 send_header(
                     conn,
                     {
                         "type": "info",
-                        "message": f"Usuário '{user_to_add}' foi adicionado ao grupo '{g}'.",
+                        "message": f"Usuário '{user_to_add}' foi adicionado ao grupo '{g_name}'.",
                     },
                 )
                 notification_header = {
                     "type": "info",
-                    "message": f"Você foi adicionado ao groupo '{g}' pelo {username}.",
+                    "message": f"Você foi adicionado ao groupo '{g_name}' pelo {username}.",
                 }
                 target = {"type": "user", "name": user_to_add}
                 message_queue.put((notification_header, None, username, target))
@@ -234,7 +234,7 @@ def client_thread(conn, addr):
                     {
                         "type": "list",
                         "online": online,
-                        "groups": {g: list(m) for g, m in groups.items()},
+                        "groups": {g_name: list(m) for g_name, m in groups.items()},
                     },
                 )
             elif t == "file":
@@ -242,8 +242,8 @@ def client_thread(conn, addr):
                 file_bytes = recv_all(conn, filesize) if filesize > 0 else b""
 
                 if header.get("target") == "group":
-                    g = header.get("group")
-                    target = {"type": "group", "name": g}
+                    g_name = header.get("group")
+                    target = {"type": "group", "name": g_name}
                     message_queue.put((header, file_bytes, username, target))
                 else:
                     to = header.get("to")
@@ -251,7 +251,7 @@ def client_thread(conn, addr):
                     message_queue.put((header, file_bytes, username, target))
 
             elif t == "quit":
-                print(f"{username} pediu quit")
+                print(f"{username} desconectou")
                 break
             else:
                 send_header(conn, {"type": "error", "message": "unknown_type"})
