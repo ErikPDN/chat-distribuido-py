@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-client.py
-Cliente CLI para o chat.
-Uso: python client.py --host HOST --port PORT --username USERNAME
+client_async.py
+Cliente CLI assíncrono para o chat.
+Uso: python client_async.py --host HOST --port PORT --username USERNAME
+
 Comandos:
   /msg <user> <message>
   /group create <group>
@@ -15,222 +16,272 @@ Comandos:
   /quit
 """
 import argparse
+import asyncio
 import json
 import os
-import socket
 import struct
-import sys
-import threading
+from typing import Optional
 
 DOWNLOADS = "downloads"
 os.makedirs(DOWNLOADS, exist_ok=True)
 
 
-def send_header(sock, header: dict):
+async def send_header(writer: asyncio.StreamWriter, header: dict):
+    """Envia um header JSON precedido pelo tamanho."""
     data = json.dumps(header).encode("utf-8")
-    sock.sendall(struct.pack(">I", len(data)) + data)
+    writer.write(struct.pack(">I", len(data)) + data)
+    await writer.drain()
 
 
-def recvall(sock, n):
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            return None
-        buf += chunk
-    return buf
-
-
-def recv_header(sock):
-    raw = recvall(sock, 4)
-    if not raw:
+async def recv_header(reader: asyncio.StreamReader) -> Optional[dict]:
+    """Recebe um header JSON precedido pelo tamanho."""
+    try:
+        raw = await reader.readexactly(4)
+        (n,) = struct.unpack(">I", raw)
+        data = await reader.readexactly(n)
+        return json.loads(data.decode("utf-8"))
+    except (asyncio.IncompleteReadError, ConnectionError, Exception):
         return None
-    (n,) = struct.unpack(">I", raw)
-    data = recvall(sock, n)
-    if not data:
-        return None
-    return json.loads(data.decode("utf-8"))
 
 
-def listener(sock):
+async def listener(reader: asyncio.StreamReader):
+    """Escuta mensagens do servidor em loop assíncrono."""
     while True:
         try:
-            header = recv_header(sock)
+            header = await recv_header(reader)
             if header is None:
-                print("Conexão perdida com servidor.")
+                print("\n[SISTEMA] Conexão perdida com servidor.")
                 break
-            t = header.get("type")
-            if t == "info":
-                print("[INFO]", header.get("message"))
-            elif t == "error":
-                print("[ERRO]", header.get("message"))
-            elif t == "msg" or t == "deliver_msg":
-                print(f"[{header.get('from')} -> você] {header.get('text')}")
-            elif t == "group_msg":
-                print(
-                    f"[{header.get('group')}][{header.get('from')}] {header.get('text')}"
-                )
-            elif t == "list":
-                print("Online:", header.get("online"))
-                print("Groups:", header.get("groups"))
-            elif t == "file" or t == "deliver_file":
+            
+            msg_type = header.get("type")
+            
+            if msg_type == "info":
+                print(f"\n[INFO] {header.get('message')}")
+            
+            elif msg_type == "error":
+                print(f"\n[ERRO] {header.get('message')}")
+            
+            elif msg_type in ("msg", "deliver_msg"):
+                print(f"\n[{header.get('from')} -> você] {header.get('text')}")
+            
+            elif msg_type == "group_msg":
+                print(f"\n[{header.get('group')}][{header.get('from')}] {header.get('text')}")
+            
+            elif msg_type == "list":
+                print(f"\n[ONLINE] {header.get('online')}")
+                print(f"[GRUPOS] {header.get('groups')}")
+            
+            elif msg_type in ("file", "deliver_file"):
                 fname = header.get("filename")
                 fsize = header.get("filesize", 0)
                 sender = header.get("from")
-                group = header.get("group")
-                data = recvall(sock, fsize) if fsize > 0 else b""
+                
+                data = await reader.readexactly(fsize) if fsize > 0 else b""
+                
                 save_name = os.path.join(DOWNLOADS, f"{sender}_{fname}")
-                with open(save_name, "wb") as f:
-                    f.write(data)
+                
+                # Escrever arquivo em thread pool para não bloquear
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, _write_file, save_name, data)
+                
                 if header.get("target") == "group":
-                    print(
-                        f"[ARQ][{header.get('group')}][{sender}] recebido arquivo: {save_name} ({fsize} bytes)"
-                    )
+                    print(f"\n[ARQUIVO][{header.get('group')}][{sender}] recebido: {save_name} ({fsize} bytes)")
                 else:
-                    print(
-                        f"[ARQ][{sender}] recebido arquivo: {save_name} ({fsize} bytes)"
-                    )
+                    print(f"\n[ARQUIVO][{sender}] recebido: {save_name} ({fsize} bytes)")
+            
             else:
-                print("[DEBUG] header:", header)
+                print(f"\n[DEBUG] header: {header}")
+            
+            # Reexibir prompt
+            print("> ", end="", flush=True)
+        
         except Exception as e:
-            print("Erro listener:", e)
+            print(f"\n[ERRO] Listener: {e}")
             break
 
 
-def interactive(sock, username):
+def _write_file(path: str, data: bytes):
+    """Helper síncrono para escrita de arquivo."""
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def _read_file(path: str) -> bytes:
+    """Helper síncrono para leitura de arquivo."""
+    with open(path, "rb") as f:
+        return f.read()
+
+
+async def send_file(writer: asyncio.StreamWriter, header: dict, path: str):
+    """Envia arquivo para servidor."""
+    await send_header(writer, header)
+    
+    # Ler arquivo em chunks via thread pool
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _read_file, path)
+    
+    # Enviar em chunks
+    chunk_size = 4096
+    for i in range(0, len(data), chunk_size):
+        chunk = data[i:i+chunk_size]
+        writer.write(chunk)
+        await writer.drain()
+
+
+async def interactive(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, username: str):
+    """Loop interativo assíncrono para comandos do usuário."""
+    loop = asyncio.get_event_loop()
+    
     while True:
         try:
-            cmd = input("> ").strip()
+            # Ler input do usuário em thread pool para não bloquear event loop
+            cmd = await loop.run_in_executor(None, input, "> ")
+            cmd = cmd.strip()
         except EOFError:
             cmd = "/quit"
+        
         if not cmd:
             continue
+        
         parts = cmd.split()
-        if parts[0] == "/msg" and len(parts) >= 3:
-            to = parts[1]
-            text = " ".join(parts[2:])
-            send_header(sock, {"type": "msg", "to": to, "text": text})
-
-        elif parts[0] == "/group" and len(parts) >= 2:
-            sub = parts[1]
-            if sub == "create" and len(parts) >= 3:
-                send_header(sock, {"type": "create_group", "group": parts[2]})
-            elif sub == "join" and len(parts) >= 3:
-                send_header(sock, {"type": "join_group", "group": parts[2]})
-            elif sub == "msg" and len(parts) >= 4:
-                g = parts[2]
-                text = " ".join(parts[3:])
-                send_header(sock, {"type": "group_msg", "group": g, "text": text})
-            elif sub == "add" and len(parts) >= 4:
-                group_name = parts[2]
-                user_to_add = parts[3]
-                send_header(
-                    sock,
-                    {
+        
+        try:
+            if parts[0] == "/msg" and len(parts) >= 3:
+                to = parts[1]
+                text = " ".join(parts[2:])
+                await send_header(writer, {"type": "msg", "to": to, "text": text})
+            
+            elif parts[0] == "/group" and len(parts) >= 2:
+                sub = parts[1]
+                
+                if sub == "create" and len(parts) >= 3:
+                    await send_header(writer, {"type": "create_group", "group": parts[2]})
+                
+                elif sub == "join" and len(parts) >= 3:
+                    await send_header(writer, {"type": "join_group", "group": parts[2]})
+                
+                elif sub == "msg" and len(parts) >= 4:
+                    group_name = parts[2]
+                    text = " ".join(parts[3:])
+                    await send_header(writer, {"type": "group_msg", "group": group_name, "text": text})
+                
+                elif sub == "add" and len(parts) >= 4:
+                    group_name = parts[2]
+                    user_to_add = parts[3]
+                    await send_header(writer, {
                         "type": "add_to_group",
                         "group": group_name,
-                        "user_to_add": user_to_add,
-                    },
-                )
+                        "user_to_add": user_to_add
+                    })
+                
+                else:
+                    print("Uso: /group create|join|msg|add...")
+            
+            elif parts[0] == "/sendfile" and len(parts) >= 3:
+                to = parts[1]
+                path = " ".join(parts[2:])
+                
+                if not os.path.exists(path):
+                    print("Arquivo não encontrado")
+                    continue
+                
+                filesize = os.path.getsize(path)
+                header = {
+                    "type": "file",
+                    "to": to,
+                    "filename": os.path.basename(path),
+                    "filesize": filesize,
+                    "target": "user"
+                }
+                
+                await send_file(writer, header, path)
+                print("Arquivo enviado.")
+            
+            elif parts[0] == "/sendgroupfile" and len(parts) >= 3:
+                group = parts[1]
+                path = " ".join(parts[2:])
+                
+                if not os.path.exists(path):
+                    print("Arquivo não encontrado")
+                    continue
+                
+                filesize = os.path.getsize(path)
+                header = {
+                    "type": "file",
+                    "group": group,
+                    "filename": os.path.basename(path),
+                    "filesize": filesize,
+                    "target": "group"
+                }
+                
+                await send_file(writer, header, path)
+                print("Arquivo de grupo enviado.")
+            
+            elif parts[0] == "/list":
+                await send_header(writer, {"type": "list"})
+            
+            elif parts[0] == "/clear":
+                os.system("cls" if os.name == "nt" else "clear")
+            
+            elif parts[0] == "/quit":
+                await send_header(writer, {"type": "quit"})
+                print("Saindo...")
+                writer.close()
+                await writer.wait_closed()
+                break
+            
             else:
-                print("Uso: /group create|join|msg|add...")
-        elif parts[0] == "/sendfile" and len(parts) >= 3:
-            to = parts[1]
-            path = " ".join(parts[2:])
-            if not os.path.exists(path):
-                print("Arquivo não encontrado")
-                continue
-            filesize = os.path.getsize(path)
-            header = {
-                "type": "file",
-                "to": to,
-                "filename": os.path.basename(path),
-                "filesize": filesize,
-                "target": "user",
-            }
-            send_header(sock, header)
-            with open(path, "rb") as f:
-                while True:
-                    chunk = f.read(4096)
-                    if not chunk:
-                        break
-                    sock.sendall(chunk)
-            print("Arquivo enviado.")
-        elif parts[0] == "/sendgroupfile" and len(parts) >= 3:
-            group = parts[1]
-            path = " ".join(parts[2:])
-            if not os.path.exists(path):
-                print("Arquivo não encontrado")
-                continue
-            filesize = os.path.getsize(path)
-            header = {
-                "type": "file",
-                "group": group,
-                "filename": os.path.basename(path),
-                "filesize": filesize,
-                "target": "group",
-            }
-            send_header(sock, header)
-            with open(path, "rb") as f:
-                while True:
-                    chunk = f.read(4096)
-                    if not chunk:
-                        break
-                    sock.sendall(chunk)
-            print("Arquivo de grupo enviado.")
-        elif parts[0] == "/list":
-            send_header(sock, {"type": "list"})
-        elif parts[0] == "/clear":
-            os.system("cls" if os.name == "nt" else "clear")
-        elif parts[0] == "/quit":
-            send_header(sock, {"type": "quit"})
-            print("Saindo...")
-            sock.close()
-            break
-        else:
-            print(
-                "Comandos: /msg <user> <text>, /group create/join/add/msg, /sendfile <user> <path>, /sendgroupfile <group> <path>, /list, /clear, /quit"
-            )
+                print("Comandos: /msg, /group, /sendfile, /sendgroupfile, /list, /clear, /quit")
+        
+        except Exception as e:
+            print(f"Erro ao processar comando: {e}")
 
-def main():
+
+async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", required=True)
     parser.add_argument("--port", type=int, default=9009)
     parser.add_argument("--username", required=True)
     args = parser.parse_args()
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     
     try:
-        sock.connect((args.host, args.port))
-    except (socket.error, ConnectionRefusedError) as e:
-        # Captura erros de socket ou quando a conexão é recusada
-        print(f"Erro ao conectar ao servidor {args.host}:{args.port} - {e}")
-        sock.close()
-        return
-    
-    # Se a conexão foi bem-sucedida, continuar com a autenticação
-    try:
-        # auth
-        send_header(sock, {"type": "auth", "username": args.username})
-        hdr = recv_header(sock)
+        # Conectar ao servidor
+        reader, writer = await asyncio.open_connection(args.host, args.port)
+        
+        # Autenticar
+        await send_header(writer, {"type": "auth", "username": args.username})
+        hdr = await recv_header(reader)
+        
         if hdr is None or hdr.get("type") == "error":
-            print("Falha ao autenticar:", hdr)
-            sock.close()
+            print(f"Falha ao autenticar: {hdr}")
+            writer.close()
+            await writer.wait_closed()
             return
+        
         print("Autenticado com sucesso.")
-
-        # Iniciar thread de escuta (listener)
-        thr = threading.Thread(target=listener, args=(sock,), daemon=True)
-        thr.start()
-
-        # Interação após autenticação
-        interactive(sock, args.username)
-
+        print("Digite /help para ver os comandos disponíveis.\n")
+        
+        # Iniciar listener em background
+        listener_task = asyncio.create_task(listener(reader))
+        
+        # Loop interativo
+        try:
+            await interactive(reader, writer, args.username)
+        finally:
+            listener_task.cancel()
+            try:
+                await listener_task
+            except asyncio.CancelledError:
+                pass
+    
+    except ConnectionRefusedError:
+        print(f"Erro: Não foi possível conectar ao servidor {args.host}:{args.port}")
     except Exception as e:
-        # Captura erro no processo de autenticação ou interação
-        print(f"Ocorreu um erro: {e}")
-        sock.close()
+        print(f"Erro: {e}")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nInterrompido pelo usuário.")
